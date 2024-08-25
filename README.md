@@ -1,6 +1,6 @@
 # RUSpy
 ## Run main_window.py to use the software
-Keyboard Shortcuts for Resonance Detector:<br/>
+## Keyboard Shortcuts for Resonance Detector
 O: save resonance to a table<br/>
 shift + R: delete resonance<br/>
 shift + S: save the resonance table as a .dat file<br/>
