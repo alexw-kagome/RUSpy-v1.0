@@ -1,5 +1,5 @@
 # RUSpy
-Keyboard Shortcuts for Resonance Detector:
+Keyboard Shortcuts for Resonance Detector:<br/>
 O: save resonance to a table
 shift + R: delete resonance 
 shift + S: save the resonance table as a .dat file
