@@ -1,5 +1,5 @@
 # RUSpy
-## Run main_window.py to use the software
+## Run main_window.py in view folder to use the software
 ## Keyboard Shortcuts for Resonance Detector
 O: save resonance to a table<br/>
 shift + R: delete resonance<br/>
