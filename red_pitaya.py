@@ -1,11 +1,7 @@
 # Control program for the Red Pitaya RUS experiment
 # Copyright (C) 2024  Alexander Won
 # Based on the data acquisition code from Albert Migliori and Red Pitaya vector network analyzer from Pavel Demin
-#
 # Ref: Reviews of Scientific Instruments Vol.90 Issue 12 Dec 2019 pgs. 121401 ff.
-# Copyright (C) 2022  Albert Migliori
-# Based heavily on the Control program for the Red Pitaya vector network analyzer
-# Copyright (C) 2021  Pavel Demin
 
 from asyncio import sleep
 from operator import pos
@@ -17,22 +13,10 @@ from matplotlib import pyplot as plt
 import os
 from pathlib import Path
 
-import serial
-import serial.tools.list_ports
 import time
-import threading
-
-from functools import partial
-from matplotlib.backend_bases import Event
-
 import numpy as np
-import math
-import csv
-import copy
-
 import matplotlib
-from numpy.core.arrayprint import str_format
-from numpy.lib.type_check import imag, real
+
 
 matplotlib.use("Qt5Agg")
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -43,26 +27,34 @@ from matplotlib.widgets import Cursor, MultiCursor
 from matplotlib.offsetbox import AnchoredOffsetbox, TextArea, HPacker, VPacker
 
 from PyQt5.uic import loadUiType
+from PyQt5 import QtCore
 from PyQt5.QtCore import QRegExp, QTimer, QSettings, QDir, Qt, QObject, QElapsedTimer
 from PyQt5.QtGui import QRegExpValidator, QPalette, QColor, QBitmap, QPixmap
 from PyQt5.QtWidgets import QApplication, QDoubleSpinBox, QMainWindow, QMessageBox, QDialog, QFileDialog, QPushButton, \
     QLabel, QSpinBox
 from PyQt5.QtNetwork import QAbstractSocket, QTcpSocket
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QSplashScreen
-# np.set_printoptions(threshold=sys.maxsize)
-import time
 
 '''
 Measurement Class to store data
 '''
 class Measurement:
-    def __init__(self, start, stop, size):
-        self.freq = np.linspace(start, stop, size)
-        self.data = np.zeros(size, np.complex64)
-
-class rus(QObject):
     def __init__(self):
-        super(rus, self).__init__()
+        self.freq = np.array([], dtype=float)
+        self.data = np.array([], dtype=np.complex64)
+
+class RedPitaya(QObject):
+
+    MAX_SWEEP_SIZE = 32766
+
+    # Signal to emit to main_window
+    data_chunk_ready = QtCore.pyqtSignal(np.ndarray)
+    sweep_finished = QtCore.pyqtSignal()
+    connected_signal = QtCore.pyqtSignal(str)
+    tracking_sweep_progress = QtCore.pyqtSignal()
+
+    def __init__(self):
+        super(RedPitaya, self).__init__()
 
         self.initialize()
         
@@ -71,19 +63,18 @@ class rus(QObject):
         '''
         self.socket = QTcpSocket(self)
         self.socket.readyRead.connect(self.read_data)
-        # self.socket.readyRead.connect(self.rp_read)
-        self.socket.connected.connect(self.connect)
+        self.socket.connected.connect(self.connected)
         self.socket.error.connect(self.error)
 
         '''
         startTimer: Detect timeout during connection
-        alexSweepTimer: Measures time took for experiment (Alex edition)
+        sweepTimer: Measures time took for experiment
         '''
         self.startTimer = QTimer(self)
         self.startTimer.timeout.connect(self.timeout)
 
-        self.alexSweepTimer = QElapsedTimer()
-    
+        self.sweepTimer = QElapsedTimer()
+
     def initialize(self):
         self.idle = True
         self.reading = False
@@ -98,24 +89,27 @@ class rus(QObject):
         self.rate = 0 
         self.voltage = 0
         self.count = 0
+        self.long_sweep_active = False
 
-        
         # buffer and offset for the incoming samples
         self.buffer = bytearray(16 * 32768)
         self.offset = 0
         self.data = np.frombuffer(self.buffer, np.complex64)
 
         # create measurements
-        self.reim = Measurement(self.sweep_start, self.sweep_stop, self.sweep_size)
+        self.reim = Measurement()
+
+        self.tracking_sweep_finished = True
     
     '''
     RP is connected.
     '''
-    def connect(self):
+    def connected(self):
         self.startTimer.stop()
-        # self.initialize()
         self.connect_status = "connected"
         self.idle = False
+        self.connected_signal.emit(self.connect_status)
+        print('Connected')
         self.set_corr(0)
         self.set_phase1(0)
         self.set_phase2(0)
@@ -126,20 +120,25 @@ class rus(QObject):
     RP timed out; update status to timeout.
     '''
     def timeout(self):
+        self.idle = True
         self.connect_status = "timeout"
+        self.connected_signal.emit(self.connect_status)
+        self.startTimer.stop()
 
     '''
     RP throws error during connection.
     '''
     def error(self):
-        self.startTimer.stop()
-        print("error")
+        self.idle = True
         self.connect_status = self.socket.errorString()
+        self.connected_signal.emit(self.connect_status)
+        self.startTimer.stop()
 
     '''
     connect to RP.
     '''
     def start(self, address):
+        self.addressValue = address.strip()
         if self.idle:
             self.socket.connectToHost(address, 1001)
             self.startTimer.start(2000)
@@ -160,7 +159,79 @@ class rus(QObject):
     '''
     def cancel(self):
         self.reading = False
+        self.tracking_sweep_finished = True
         self.socket.write(struct.pack("<I", 11 << 28))
+
+    def start_tracking_sweep(self, sweeps):
+        self.tracking_sweep_queue = list(sweeps)
+        self.tracking_sweep_finished = False
+        self._tracking_sweep_index = 0
+        if not hasattr(self, '_tracking_sweep_progress_connected'):
+            self.tracking_sweep_progress.connect(self._on_tracking_sweep_progress)
+            self._tracking_sweep_progress_connected = True
+        self._start_next_tracking_sweep()
+
+    def _start_next_tracking_sweep(self):
+        if not hasattr(self, 'tracking_sweep_queue') or self._tracking_sweep_index >= len(self.tracking_sweep_queue):
+            self.tracking_sweep_finished = True
+            self.sweep_finished.emit()
+            return
+        sweep = self.tracking_sweep_queue[self._tracking_sweep_index]
+        self.limit = 16 * int(sweep[2])
+        self.numsample = max(5, int(sweep[2] / 1e3))
+        self.start_long_sweep(sweep[0], sweep[1], int(sweep[2]))
+
+    def _on_tracking_sweep_progress(self):
+        self._tracking_sweep_index += 1
+        self._start_next_tracking_sweep()
+
+    def start_long_sweep(self, sweep_start, sweep_stop, sweep_size):
+        """
+        Multiple subsweeps
+        """
+        self.long_sweep_active = True
+        self.long_sweep_start = sweep_start
+        self.long_sweep_stop = sweep_stop
+        self.long_sweep_size = sweep_size
+        self.long_sweep_data = []
+        self.long_sweep_freq = []
+        self.long_sweep_index = 0
+        self._start_next_subsweep()
+
+    def _start_next_subsweep(self):
+        total_size = self.long_sweep_size
+        max_size = self.MAX_SWEEP_SIZE
+        idx = self.long_sweep_index
+        sub_size = min(max_size, total_size - idx * max_size)
+        
+        if sub_size <= 0:
+            # sweep finished
+            self.long_sweep_active = False
+            all_data = np.concatenate(self.long_sweep_data)
+            all_freq = np.concatenate(self.long_sweep_freq)
+            self.reim.freq = np.concatenate((self.reim.freq, all_freq))
+            self.reim.data = np.concatenate((self.reim.data, all_data))
+            self.tracking_sweep_progress.emit()
+
+            if self.tracking_sweep_finished:
+                self.sweep_finished.emit()
+            return
+        
+        # sub-sweep parameters
+        start = self.long_sweep_start + (self.long_sweep_stop - self.long_sweep_start) * (idx * max_size) / total_size
+        stop = self.long_sweep_start + (self.long_sweep_stop - self.long_sweep_start) * ((idx * max_size + sub_size - 1) / (total_size - 1))
+        self.sweep_start = start
+        self.sweep_stop = stop
+        self.sweep_size = sub_size
+        self.set_sweep_size(sub_size)
+        self.long_sweep_index += 1
+        self.offset = 0
+        self.count = 0
+        self.reading = True
+        self.socket.write(struct.pack("<I", 0 << 28 | int(self.sweep_start)))
+        self.socket.write(struct.pack("<I", 1 << 28 | int(self.sweep_stop)))
+        self.socket.write(struct.pack("<I", 2 << 28 | int(self.sweep_size)))
+        self.socket.write(struct.pack("<I", 10 << 28))
 
     '''
     read data from RP.
@@ -168,38 +239,53 @@ class rus(QObject):
     note: we only retreive data once experiment is over.
     '''
     def read_data(self):
-        if self.count == 0:
-            print(time.time() - self.start_time)
         self.count = self.count + 1
-        while (self.socket.bytesAvailable() > 0):
+
+        while self.socket.bytesAvailable() > 0:
             if not self.reading:
                 self.socket.readAll()
                 return
             size = self.socket.bytesAvailable()
-            # print(size)
-            limit = 16 * self.sweep_size
-            # collect data
-            if self.offset + size < limit:
-                self.buffer[self.offset:self.offset + size] = self.socket.read(size)
-                self.offset += size
-            # we are at the end of buffer; sweep over
-            else:
-                self.buffer[self.offset:limit] = self.socket.read(limit - self.offset)
+            bytes_to_read = min(size, self.limit - self.offset)
+            self.buffer[self.offset:self.offset + bytes_to_read] = self.socket.read(bytes_to_read)
+            prev_offset = self.offset
+            self.offset += bytes_to_read
+            # numsample samples, 16 bytes per sample (complex64)
+            # Emit signal for every 'sample' samples received
+            while prev_offset // 16 < self.offset // 16:
+                start_sample = (prev_offset // 16) // self.numsample * self.numsample
+                end_sample = min(((start_sample + self.numsample), self.offset // 16, self.sweep_size))
+                if end_sample - start_sample == self.numsample:
+                    chunk = self.data[start_sample * 2:(start_sample + self.numsample) * 2]  # 2 channels per sample
+                    self.data_chunk_ready.emit(chunk.copy())
+                    prev_offset = (start_sample + self.numsample) * 16
+                else:
+                    break
+
+            # If sweep is over
+            if self.offset >= self.limit:
                 adc1 = self.data[0::2]
-                # adc2 = self.data[1::2]
-                attr = getattr(self, "reim")
                 start = self.sweep_start
                 stop = self.sweep_stop
                 size = self.sweep_size
-                attr.freq = np.linspace(start, stop, size)
-                attr.data = adc1[0:size].copy()
-                attr.unity = np.full(size, 1)
-                self.reading = False
-                self.elapsedTime = self.alexSweepTimer.elapsed()/1000
-                print(self.elapsedTime)
-                # print(self.reim.freq)
-                # print(self.reim.data)
+                freq = np.linspace(start, stop, size)
+                data = adc1[0:size].copy()
 
+                if self.long_sweep_active == True:
+                    self.long_sweep_data.append(data)
+                    self.long_sweep_freq.append(freq)
+                    self.reading = False
+                    # Start next sub-sweep
+                    self._start_next_subsweep()
+                else:
+                    attr = getattr(self, "reim")
+                    attr.freq = freq
+                    attr.data = data
+                    attr.unity = np.full(size, 1)
+                    self.reading = False
+                    self.elapsedTime = self.sweepTimer.elapsed()*1e3
+                    self.sweep_finished.emit()
+                
     """
     Performs Sweep by input commands.
 
@@ -216,19 +302,17 @@ class rus(QObject):
     "<I" is formatting
     """
     def sweep(self):
-        print("sweep")
         self.start_time = time.time()
         if self.idle: return
         self.offset = 0
         self.count = 0
         self.reading = True
-        # print(f"{self.sweep_start} {self.sweep_stop} {self.sweep_size}")
-        self.socket.write(struct.pack("<I", 0 << 28 | int(self.sweep_start * 1000)))
-        self.socket.write(struct.pack("<I", 1 << 28 | int(self.sweep_stop * 1000)))
+        print(f"start: {self.sweep_start} stop: {self.sweep_stop} # data: {self.sweep_size}")
+        self.socket.write(struct.pack("<I", 0 << 28 | int(self.sweep_start)))
+        self.socket.write(struct.pack("<I", 1 << 28 | int(self.sweep_stop)))
         self.socket.write(struct.pack("<I", 2 << 28 | int(self.sweep_size)))
         self.socket.write(struct.pack("<I", 10 << 28))
-        # print('sweep data inputted')
-        self.alexSweepTimer.start()
+        self.sweepTimer.start()
 
     """
     Sets the rate of data collection. Higher the rate, more data points are collected and averaged out.
@@ -239,21 +323,15 @@ class rus(QObject):
     rate of 300 have similar sweep time as the labview software.
     """
     def set_rate(self, value):
-
         if self.idle: return
-        rate = [30, 100, 300, 1000, 3000, 10000, 30000, 100000][int(value)]
-        self.rate = rate
-        # print(f"{rate}")
-        # rate = [10, 50, 100, 500, 1000, 5000, 10000, 50000][value]
-        # self.rateValue.addItems(["5000", "1000", "500", "100", "50", "10", "5", "1"])
-        self.socket.write(struct.pack("<I", 3 << 28 | int(rate)))
+        self.rate = [30, 100, 300, 1000, 3000, 10000, 30000, 100000][int(value)]
+        self.socket.write(struct.pack("<I", 3 << 28 | int(self.rate)))
         # print('3<<')
 
     """
     set it to 0. Not needed for RUS. VNA artifact
     """
     def set_corr(self, value):
-
         if self.idle: return
         self.socket.write(struct.pack("<I", 4 << 28 | int(value & 0xfffffff)))
         # print('4<<')
@@ -327,28 +405,20 @@ class rus(QObject):
     Sets stepValue. stepValue is the step frequency at which we increment during sweep. We DO NOT INPUT THIS NUMBER TO RP
     """
     def set_step_value(self):
-        self.stepValue = np.round(1000 * (self.sweep_stop - self.sweep_start) / self.sweep_size, 3)
+        self.stepValue = np.round((self.sweep_stop - self.sweep_start) / self.sweep_size, 3)
 
     """
     Sets sweep_size. sweep_size is the total number of frequency points in the scan
     """
     def set_sweep_size(self, value):
         self.sweep_size = int(value)
-        # if self.stepValue == 0: return
-        # self.sweep_size = int(1000 * (self.sweep_stop - self.sweep_start) / self.stepValue)
+        # Total number of samples to acquire
+        self.limit = 16 * self.sweep_size
+        # number of samples to live emit (at least 5)
+        self.numsample = max(5, int(self.sweep_size / 1e3))
 
-        # if self.stepValue == 0: return
-        # self.sweep_size = int(1000 * (self.sweep_stop - self.sweep_start) / self.stepValue)
-        # if self.sweep_size > 32766:
-        #     self.sweep_size = 32766
-        #     self.stepValue = int((1000 * (self.sweep_stop - self.sweep_start)) / 32766 + 0.5)
-        #     if self.stepValue <= 1: self.stepValue = 1
-        # print(self.sweep_size)
-
-    
     def set_addressValue(self, value):
         self.addressValue = value.strip()
-        print(self.addressValue)
 
     def set_reim(self, value):
         self.reim = value
@@ -356,6 +426,9 @@ class rus(QObject):
     def set_connection_status(self, value):
         self.connection_status = value
 
+    def reset_reim(self):
+        self.reim = Measurement()
+        
     """
     Get methods
     """
